@@ -295,36 +295,46 @@ class ManualGATConv(nn.Module):
 
     def forward(self, x, edge_index, edge_attr):
         src_idx, dst_idx = edge_index[0], edge_index[1]
-        N, H, D = x.size(0), self.heads, self.d_head
+        N   = x.size(0)
+        H   = self.heads
+        D   = self.d_head
+        E   = src_idx.size(0)
 
-        x_src = self.W_src(x).view(N, H, D)
-        x_dst = self.W_dst(x).view(N, H, D)
+        x_src = self.W_src(x).view(N, H, D)    # (N, H, D)
+        x_dst = self.W_dst(x).view(N, H, D)    # (N, H, D)
 
-        e_src  = x_src[src_idx]                                # (E, H, D)
-        e_dst  = x_dst[dst_idx]                                # (E, H, D)
-        e_feat = self.W_edge(edge_attr)                         # (E, H)
+        e_src  = x_src[src_idx]                # (E, H, D)
+        e_dst  = x_dst[dst_idx]                # (E, H, D)
+        e_feat = self.W_edge(edge_attr)         # (E, H)
 
-        alpha  = (self.att * (e_src + e_dst)).sum(-1) + e_feat  # (E, H)
-        alpha  = torch.nn.functional.leaky_relu(alpha, 0.2)
-        alpha  = alpha - alpha.max()
-        alpha  = torch.exp(alpha)                               # (E, H)
+        # attention score per head
+        att_expanded = self.att.expand(E, H, D) # (E, H, D)
+        alpha = (att_expanded * (e_src + e_dst)).sum(dim=2)  # (E, H) — explicit dim
+        assert alpha.shape == (E, H), f"alpha shape wrong: {alpha.shape}"
 
-        # ── FIX: use 2D scatter (N, H) not 3D ────────────────────────────
-        denom  = torch.zeros(N, H, device=x.device)
-        idx_2d = dst_idx.unsqueeze(1).expand(-1, H)             # (E, H)
+        alpha = alpha + e_feat                  # (E, H)
+        alpha = torch.nn.functional.leaky_relu(alpha, 0.2)
+        alpha = alpha - alpha.max(dim=0, keepdim=True).values
+        alpha = torch.exp(alpha)                # (E, H)
+
+        # normalise per destination node
+        denom  = torch.zeros(N, H, device=x.device, dtype=alpha.dtype)
+        idx_2d = dst_idx.unsqueeze(1).expand(E, H)   # (E, H)
+        assert idx_2d.shape == alpha.shape, \
+            f"idx_2d {idx_2d.shape} vs alpha {alpha.shape}"
         denom.scatter_add_(0, idx_2d, alpha)
         denom  = denom.clamp(min=1e-6)
 
-        alpha_norm = self.drop(alpha / denom[dst_idx])          # (E, H)
+        alpha_norm = self.drop(alpha / denom[dst_idx])  # (E, H)
 
-        # ── FIX: aggregate messages correctly ────────────────────────────
-        # msgs: (E, H*D) then scatter into (N, H*D)
-        msgs   = (x_src * alpha_norm.unsqueeze(-1)).view(-1, H * D)  # (E, H*D)
-        out    = torch.zeros(N, H * D, device=x.device)
-        idx_hd = dst_idx.unsqueeze(1).expand(-1, H * D)              # (E, H*D)
+        # aggregate messages
+        msgs   = (e_src * alpha_norm.unsqueeze(2))      # (E, H, D)
+        msgs   = msgs.reshape(E, H * D)                 # (E, H*D)
+        out    = torch.zeros(N, H * D, device=x.device, dtype=msgs.dtype)
+        idx_hd = dst_idx.unsqueeze(1).expand(E, H * D)  # (E, H*D)
         out.scatter_add_(0, idx_hd, msgs)
 
-        return out                                              # (N, H*D)
+        return out                                       # (N, H*D)                             # (N, H*D)
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=128, n_classes=4, n_layers=3):
