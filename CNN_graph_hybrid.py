@@ -308,9 +308,9 @@ class ManualGATConv(nn.Module):
 
         # attention score (E, 1)
         e_feat = self.W_edge(edge_attr.float())          # (E, 1)
-        score  = self.a(torch.tanh(e_src + e_dst))       # (E, 1)
-        score  = score + e_feat                           # (E, 1)
-        score  = torch.nn.functional.leaky_relu(score.squeeze(1), 0.2)  # (E,)
+        score  = self.a(torch.tanh(e_src + e_dst)).view(-1)   # force (E,)
+        score  = score + e_feat.view(-1)                       # force (E,)
+        score  = torch.nn.functional.leaky_relu(score, 0.2)   # (E,)
 
         # softmax per destination
         score  = score - score.max()
@@ -319,7 +319,7 @@ class ManualGATConv(nn.Module):
 
         # normalize
         norm = torch.zeros(N, device=x.device, dtype=score.dtype)
-        norm.scatter_add_(0, dst_idx, score)
+        norm.scatter_add_(0, dst_idx.view(-1), score.view(-1))
         norm = norm.clamp(min=1e-6)
         alpha = score / norm[dst_idx]                    # (E,)
 
@@ -327,11 +327,8 @@ class ManualGATConv(nn.Module):
         msgs = e_src * alpha.unsqueeze(1)                # (E, out_dim)
         out  = torch.zeros(N, self.out_dim,
                            device=x.device, dtype=msgs.dtype)
-        out.scatter_add_(
-            0,
-            dst_idx.unsqueeze(1).expand(E, self.out_dim),
-            msgs
-        )
+        idx = dst_idx.view(-1, 1).expand(E, self.out_dim)
+        out.scatter_add_(0, idx, msgs)
         return out                                       # (N, out_dim)                       # (N, H*D)                                 # (N, H*D)                                  # (N, H*D)                             # (N, H*D)
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
