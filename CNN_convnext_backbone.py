@@ -248,39 +248,51 @@ class Downsample(nn.Module):
         return self.norm(x)
 
 class FloodCNN(nn.Module):
-    """A compact ConvNeXt-style backbone for multi-channel raster patches."""
+    """ConvNeXt-style backbone adapted for multi-channel raster patches."""
     def __init__(self, in_channels, n_classes=4, dims=(64, 128, 256), depths=(2, 2, 3)):
         super().__init__()
         assert len(dims) == len(depths)
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, dims[0], kernel_size=4, stride=2, padding=1),
-            LayerNorm2d(dims[0]),
-        )
 
-        stages = []
-        in_dim = dims[0]
-        for stage_idx, (dim, depth) in enumerate(zip(dims, depths)):
-            if stage_idx == 0:
-                stage_in = in_dim
-            else:
-                stages.append(Downsample(in_dim, dim))
-                stage_in = dim
-                in_dim = dim
-            blocks = [ConvNeXtBlock(stage_in) for _ in range(depth)]
-            stages.append(nn.Sequential(*blocks))
-            in_dim = stage_in
-            if stage_idx < len(dims) - 1:
-                # Update in_dim to the next stage width after downsampling.
-                in_dim = dims[stage_idx + 1]
-        self.stages = nn.ModuleList(stages)
+        # Proper downsample pipeline:
+        # input -> dims[0] -> dims[1] -> dims[2]
+        self.downsample_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, dims[0], kernel_size=4, stride=2, padding=1),
+                LayerNorm2d(dims[0]),
+            ),
+            nn.Sequential(
+                LayerNorm2d(dims[0]),
+                nn.Conv2d(dims[0], dims[1], kernel_size=2, stride=2),
+            ),
+            nn.Sequential(
+                LayerNorm2d(dims[1]),
+                nn.Conv2d(dims[1], dims[2], kernel_size=2, stride=2),
+            ),
+        ])
 
-        self.head_norm = nn.LayerNorm(dims[-1])
+        self.stages = nn.ModuleList([
+            nn.Sequential(*[ConvNeXtBlock(dims[0]) for _ in range(depths[0])]),
+            nn.Sequential(*[ConvNeXtBlock(dims[1]) for _ in range(depths[1])]),
+            nn.Sequential(*[ConvNeXtBlock(dims[2]) for _ in range(depths[2])]),
+        ])
+
+        self.norm = nn.LayerNorm(dims[-1])
         self.head = nn.Sequential(
             nn.Linear(dims[-1], 256),
             nn.GELU(),
             nn.Dropout(0.3),
             nn.Linear(256, n_classes)
         )
+
+    def forward(self, x):
+        for down, stage in zip(self.downsample_layers, self.stages):
+            x = down(x)
+            x = stage(x)
+
+        x = x.mean(dim=(-2, -1))   # global average pooling
+        x = self.norm(x)
+        x = self.head(x)
+        return x
 
     def forward(self, x):
         x = self.stem(x)
