@@ -21,10 +21,10 @@ DATA_DIR   = '/workspace/Data-Flood/'
 PATCH_SIZE = 11
 HALF       = PATCH_SIZE // 2
 BATCH_SIZE = 512
-N_EPOCHS   = 40
-LR         = 3e-4
+N_EPOCHS = 60
+LR       = 1e-3
 TARGET_COL = 'risk_0_2m'
-BASIN_SIZE = 100   # 50x50 pixels = 1km x 1km per node
+BASIN_SIZE = 50   # 50x50 pixels = 1km x 1km per node
 
 FEATURE_COLS = [
     'dtm_zscore', 'log_flow_acc', 'imd', 'waw',
@@ -451,15 +451,23 @@ tr_labels = y_s[train_mask].numpy()
 tr_labels = tr_labels[tr_labels >= 0]
 cc        = Counter(tr_labels.tolist())
 tot       = sum(cc.values())
-cw        = torch.tensor(
-    [tot / (4 * cc.get(c, 1)) for c in range(4)],
+raw_weights = [tot / (4 * cc.get(c, 1)) for c in range(4)]
+# Cap at 2x to prevent collapse
+max_w = 2.0
+cw = torch.tensor(
+    [min(w, max_w) for w in raw_weights],
     dtype=torch.float32
 ).to(device)
-print(f"Class weights: {cw.cpu().numpy().round(3)}")
+print(f"Class weights (capped): {cw.cpu().numpy().round(3)}")
 
 criterion = nn.CrossEntropyLoss(weight=cw, label_smoothing=0.1)
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS)
+# Replace scheduler with warmup + cosine
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer, max_lr=LR,
+    total_steps=N_EPOCHS,
+    pct_start=0.1
+)
 scaler    = torch.amp.GradScaler('cuda')
 
 # Move everything to device
@@ -489,17 +497,14 @@ best_state   = None
 def forward_chunked(model, patches, x_node, edge_index, edge_attr,
                     device, chunk_size=128):
     cnn_feats = []
-    with torch.no_grad() if not model.training else torch.enable_grad():
-        for i in range(0, patches.shape[0], chunk_size):
-            chunk = patches[i:i+chunk_size].to(device)
-            with torch.amp.autocast('cuda'):
-                feats = model.cnn(chunk)
-            cnn_feats.append(feats)
-            del chunk
+    for i in range(0, patches.shape[0], chunk_size):
+        chunk = patches[i:i+chunk_size].to(device)
+        feats = model.cnn(chunk)
+        cnn_feats.append(feats)
+        del chunk
     cnn_feats  = torch.cat(cnn_feats, dim=0)
     node_feats = torch.cat([cnn_feats, x_node], dim=1)
-    with torch.amp.autocast('cuda'):
-        return model.gnn(node_feats, edge_index, edge_attr)
+    return model.gnn(node_feats, edge_index, edge_attr)
 
 for epoch in range(1, N_EPOCHS + 1):
     t0 = time.time()
