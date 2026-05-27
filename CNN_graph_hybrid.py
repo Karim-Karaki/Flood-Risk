@@ -227,6 +227,18 @@ def build_basin_graph(feat_grid, label_grid, flow_dir_grid, basin_size=50):
                     edge_attr.append(1.0)  # hydrological
 
     edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
+    # After building edge_src, edge_dst, edge_attr lists
+    # Filter to only keep edges where both endpoints are valid
+    valid_set = set(np.where(node_valid)[0].tolist())
+    filtered_src, filtered_dst, filtered_attr = [], [], []
+    for s, d, a in zip(edge_src, edge_dst, edge_attr):
+        if s in valid_set and d in valid_set:
+            filtered_src.append(s)
+            filtered_dst.append(d)
+            filtered_attr.append(a)
+
+    edge_index = torch.tensor([filtered_src, filtered_dst], dtype=torch.long)
+    edge_attr  = torch.tensor(filtered_attr, dtype=torch.float).unsqueeze(1)
     edge_attr  = torch.tensor(edge_attr,  dtype=torch.float).unsqueeze(1)
     x          = torch.tensor(node_feats, dtype=torch.float)
     y          = torch.tensor(node_labels,dtype=torch.long)
@@ -288,26 +300,29 @@ class ManualGATConv(nn.Module):
         x_src = self.W_src(x).view(N, H, D)
         x_dst = self.W_dst(x).view(N, H, D)
 
-        e_src  = x_src[src_idx]                               # (E, H, D)
-        e_dst  = x_dst[dst_idx]                               # (E, H, D)
-        e_feat = self.W_edge(edge_attr)                        # (E, H)
+        e_src  = x_src[src_idx]
+        e_dst  = x_dst[dst_idx]
+        e_feat = self.W_edge(edge_attr)
 
-        alpha  = (self.att * (e_src + e_dst)).sum(-1) + e_feat # (E, H)
+        alpha  = (self.att * (e_src + e_dst)).sum(-1) + e_feat
         alpha  = torch.nn.functional.leaky_relu(alpha, 0.2)
         alpha  = alpha - alpha.max()
         alpha  = torch.exp(alpha)
 
         denom  = torch.zeros(N, H, device=x.device)
-        denom.scatter_add_(0, dst_idx.unsqueeze(1).expand(-1, H), alpha)
+        # ── FIX: clamp edge indices to valid range ────────────────────────
+        dst_clamped = dst_idx.clamp(0, N - 1)
+        src_clamped = src_idx.clamp(0, N - 1)
+        denom.scatter_add_(0, dst_clamped.unsqueeze(1).expand(-1, H), alpha)
         denom  = denom.clamp(min=1e-6)
 
-        alpha_norm = self.drop(alpha / denom[dst_idx])         # (E, H)
+        alpha_norm = self.drop(alpha / denom[dst_clamped])
 
-        msgs = x_src * alpha_norm.unsqueeze(-1)                # (E, H, D)
+        msgs = x_src * alpha_norm.unsqueeze(-1)
         out  = torch.zeros(N, H, D, device=x.device)
-        out.scatter_add_(0, dst_idx.view(-1,1,1).expand_as(msgs), msgs)
+        out.scatter_add_(0, dst_clamped.view(-1,1,1).expand_as(msgs), msgs)
 
-        return out.view(N, H * D)                              # (N, out_dim)
+        return out.view(N, H * D)                            # (N, out_dim)
 
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
