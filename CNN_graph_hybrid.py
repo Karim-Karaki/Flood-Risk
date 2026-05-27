@@ -285,56 +285,58 @@ class ManualGATConv(nn.Module):
     def __init__(self, in_dim, out_dim, heads=4, edge_dim=1, dropout=0.2):
         super().__init__()
         self.heads  = heads
+        self.out_dim = out_dim
         self.d_head = out_dim // heads
         self.W_src  = nn.Linear(in_dim,   out_dim, bias=False)
         self.W_dst  = nn.Linear(in_dim,   out_dim, bias=False)
         self.W_edge = nn.Linear(edge_dim, heads,   bias=False)
-        self.att    = nn.Parameter(torch.randn(1, heads, self.d_head))
+        # ── FIX: att is (H,) not (1, H, D) ──────────────────────────
+        self.att    = nn.Parameter(torch.randn(heads))
         self.drop   = nn.Dropout(dropout)
-        nn.init.xavier_uniform_(self.att)
+        nn.init.xavier_uniform_(self.att.unsqueeze(0).unsqueeze(0))
 
     def forward(self, x, edge_index, edge_attr):
         src_idx, dst_idx = edge_index[0], edge_index[1]
-        N   = x.size(0)
-        H   = self.heads
-        D   = self.d_head
-        E   = src_idx.size(0)
+        N = x.size(0)
+        H = self.heads
+        D = self.d_head
+        E = src_idx.size(0)
 
-        x_src = self.W_src(x).view(N, H, D)    # (N, H, D)
-        x_dst = self.W_dst(x).view(N, H, D)    # (N, H, D)
+        # Project to (N, H, D)
+        x_src = self.W_src(x).view(N, H, D)
+        x_dst = self.W_dst(x).view(N, H, D)
 
-        e_src  = x_src[src_idx]                # (E, H, D)
-        e_dst  = x_dst[dst_idx]                # (E, H, D)
-        e_feat = self.W_edge(edge_attr)         # (E, H)
+        # Gather edge endpoints
+        e_src = x_src[src_idx]   # (E, H, D)
+        e_dst = x_dst[dst_idx]   # (E, H, D)
 
-        # attention score per head
-        att_expanded = self.att.expand(E, H, D) # (E, H, D)
-        alpha = (att_expanded * (e_src + e_dst)).sum(dim=2)  # (E, H) — explicit dim
-        assert alpha.shape == (E, H), f"alpha shape wrong: {alpha.shape}"
+        # Sum over D dimension to get (E, H)
+        combined = (e_src + e_dst)                    # (E, H, D)
+        alpha    = (combined * self.att.view(1, H, 1)).sum(dim=2)  # (E, H)
 
-        alpha = alpha + e_feat                  # (E, H)
-        alpha = torch.nn.functional.leaky_relu(alpha, 0.2)
-        alpha = alpha - alpha.max(dim=0, keepdim=True).values
-        alpha = torch.exp(alpha)                # (E, H)
+        # Add edge type contribution
+        e_feat = self.W_edge(edge_attr)               # (E, H)
+        alpha  = alpha + e_feat                        # (E, H)
+        alpha  = torch.nn.functional.leaky_relu(alpha, 0.2)
+        alpha  = alpha - alpha.max(dim=0, keepdim=True).values
+        alpha  = torch.exp(alpha)                      # (E, H)
 
-        # normalise per destination node
+        # Normalise per destination node
         denom  = torch.zeros(N, H, device=x.device, dtype=alpha.dtype)
-        idx_2d = dst_idx.unsqueeze(1).expand(E, H)   # (E, H)
-        assert idx_2d.shape == alpha.shape, \
-            f"idx_2d {idx_2d.shape} vs alpha {alpha.shape}"
+        idx_2d = dst_idx.unsqueeze(1).expand(E, H)    # (E, H)
         denom.scatter_add_(0, idx_2d, alpha)
         denom  = denom.clamp(min=1e-6)
 
-        alpha_norm = self.drop(alpha / denom[dst_idx])  # (E, H)
+        alpha_norm = self.drop(alpha / denom[dst_idx]) # (E, H)
 
-        # aggregate messages
-        msgs   = (e_src * alpha_norm.unsqueeze(2))      # (E, H, D)
-        msgs   = msgs.reshape(E, H * D)                 # (E, H*D)
+        # Aggregate messages (E, H, D) → (N, H*D)
+        msgs   = (e_src * alpha_norm.unsqueeze(2))     # (E, H, D)
+        msgs   = msgs.reshape(E, H * D)                # (E, H*D)
         out    = torch.zeros(N, H * D, device=x.device, dtype=msgs.dtype)
-        idx_hd = dst_idx.unsqueeze(1).expand(E, H * D)  # (E, H*D)
+        idx_hd = dst_idx.unsqueeze(1).expand(E, H * D) # (E, H*D)
         out.scatter_add_(0, idx_hd, msgs)
 
-        return out                                       # (N, H*D)                             # (N, H*D)
+        return out                                     # (N, H*D)                                  # (N, H*D)                             # (N, H*D)
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=128, n_classes=4, n_layers=3):
