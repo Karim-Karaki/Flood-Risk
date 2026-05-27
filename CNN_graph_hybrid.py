@@ -282,73 +282,57 @@ print(f"Northumbria patches: {patches_n.shape}")
 
 # ── 7. Manual GAT (no torch-geometric dependency) ────────────────────
 class ManualGATConv(nn.Module):
+    """Single-head GAT — no shape ambiguity."""
     def __init__(self, in_dim, out_dim, heads=4, edge_dim=1, dropout=0.2):
         super().__init__()
-        self.heads   = heads
+        # ignore heads — single head for stability
         self.out_dim = out_dim
-        self.d_head  = out_dim // heads
-        self.W_q     = nn.Linear(in_dim,   out_dim, bias=False)
-        self.W_k     = nn.Linear(in_dim,   out_dim, bias=False)
-        self.W_v     = nn.Linear(in_dim,   out_dim, bias=False)
-        self.W_edge  = nn.Linear(edge_dim, heads,   bias=False)
-        self.scale   = self.d_head ** -0.5
+        self.W_src   = nn.Linear(in_dim,   out_dim, bias=False)
+        self.W_dst   = nn.Linear(in_dim,   out_dim, bias=False)
+        self.W_edge  = nn.Linear(edge_dim, 1,       bias=False)
+        self.a       = nn.Linear(out_dim,  1,       bias=False)
         self.drop    = nn.Dropout(dropout)
 
     def forward(self, x, edge_index, edge_attr):
         src_idx, dst_idx = edge_index[0], edge_index[1]
         N = x.size(0)
-        H = self.heads
-        D = self.d_head
         E = src_idx.size(0)
 
-        # Linear projections — all (N, H*D)
-        Q = self.W_q(x).view(N, H, D)   # queries
-        K = self.W_k(x).view(N, H, D)   # keys
-        V = self.W_v(x).view(N, H, D)   # values
+        # (N, out_dim)
+        h_src = self.W_src(x)
+        h_dst = self.W_dst(x)
 
-        # Gather src/dst
-        Q_src = Q[src_idx]   # (E, H, D)
-        K_dst = K[dst_idx]   # (E, H, D)
-        V_src = V[src_idx]   # (E, H, D)
+        # (E, out_dim)
+        e_src = h_src[src_idx]
+        e_dst = h_dst[dst_idx]
 
-        # Attention scores (E, H)
-        scores = (Q_src * K_dst).sum(dim=2) * self.scale   # (E, H)
-        e_feat = self.W_edge(edge_attr.float())             # (E, H)
-        scores = scores + e_feat
+        # attention score (E, 1)
+        e_feat = self.W_edge(edge_attr.float())          # (E, 1)
+        score  = self.a(torch.tanh(e_src + e_dst))       # (E, 1)
+        score  = score + e_feat                           # (E, 1)
+        score  = torch.nn.functional.leaky_relu(score.squeeze(1), 0.2)  # (E,)
 
-        # Per-edge softmax via stable exp
-        scores = scores - scores.max()
-        scores = torch.exp(scores)                          # (E, H)
-        scores = self.drop(scores)
+        # softmax per destination
+        score  = score - score.max()
+        score  = torch.exp(score)                        # (E,)
+        score  = self.drop(score)
 
-        # Normalize: sum scores per destination node
-        # Use loop over heads to avoid scatter_add_ dimension issues
-        out = torch.zeros(N, H, D, device=x.device, dtype=x.dtype)
-        norm = torch.zeros(N, H, device=x.device, dtype=x.dtype)
+        # normalize
+        norm = torch.zeros(N, device=x.device, dtype=score.dtype)
+        norm.scatter_add_(0, dst_idx, score)
+        norm = norm.clamp(min=1e-6)
+        alpha = score / norm[dst_idx]                    # (E,)
 
-        for h in range(H):
-            s_h   = scores[:, h]                           # (E,)
-            v_h   = V_src[:, h, :]                         # (E, D)
-            msg_h = v_h * s_h.unsqueeze(1)                 # (E, D)
-
-            # scatter into (N, D)
-            out_h  = torch.zeros(N, D, device=x.device, dtype=x.dtype)
-            norm_h = torch.zeros(N,    device=x.device, dtype=x.dtype)
-
-            out_h.scatter_add_(
-                0,
-                dst_idx.unsqueeze(1).expand(E, D),
-                msg_h
-            )
-            norm_h.scatter_add_(
-                0,
-                dst_idx,
-                s_h
-            )
-            norm_h = norm_h.clamp(min=1e-6)
-            out[:, h, :] = out_h / norm_h.unsqueeze(1)
-
-        return out.reshape(N, H * D)                       # (N, H*D)                                 # (N, H*D)                                  # (N, H*D)                             # (N, H*D)
+        # aggregate messages
+        msgs = e_src * alpha.unsqueeze(1)                # (E, out_dim)
+        out  = torch.zeros(N, self.out_dim,
+                           device=x.device, dtype=msgs.dtype)
+        out.scatter_add_(
+            0,
+            dst_idx.unsqueeze(1).expand(E, self.out_dim),
+            msgs
+        )
+        return out                                       # (N, out_dim)                       # (N, H*D)                                 # (N, H*D)                                  # (N, H*D)                             # (N, H*D)
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=128, n_classes=4, n_layers=3):
@@ -367,15 +351,15 @@ class HydroGNN(nn.Module):
         # Each GAT layer: in=hidden_dim, out=hidden_dim, heads=4
         # out_dim per head = hidden_dim // 4
         self.gat_layers = nn.ModuleList([
-            ManualGATConv(
-                in_dim   = hidden_dim,
-                out_dim  = hidden_dim,   # total output = hidden_dim
-                heads    = 4,
-                edge_dim = 1,
-                dropout  = 0.2
-            )
-            for _ in range(n_layers)
-        ])
+    ManualGATConv(
+        in_dim   = hidden_dim,
+        out_dim  = hidden_dim,
+        heads    = 1,          # ignored internally
+        edge_dim = 1,
+        dropout  = 0.2
+    )
+    for _ in range(n_layers)
+])
         self.layer_norms = nn.ModuleList([
             nn.LayerNorm(hidden_dim) for _ in range(n_layers)
         ])
