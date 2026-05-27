@@ -284,16 +284,15 @@ print(f"Northumbria patches: {patches_n.shape}")
 class ManualGATConv(nn.Module):
     def __init__(self, in_dim, out_dim, heads=4, edge_dim=1, dropout=0.2):
         super().__init__()
-        self.heads  = heads
+        self.heads   = heads
         self.out_dim = out_dim
-        self.d_head = out_dim // heads
-        self.W_src  = nn.Linear(in_dim,   out_dim, bias=False)
-        self.W_dst  = nn.Linear(in_dim,   out_dim, bias=False)
-        self.W_edge = nn.Linear(edge_dim, heads,   bias=False)
-        # ── FIX: att is (H,) not (1, H, D) ──────────────────────────
-        self.att    = nn.Parameter(torch.randn(heads))
-        self.drop   = nn.Dropout(dropout)
-        nn.init.xavier_uniform_(self.att.unsqueeze(0).unsqueeze(0))
+        self.d_head  = out_dim // heads
+        self.W_q     = nn.Linear(in_dim,   out_dim, bias=False)
+        self.W_k     = nn.Linear(in_dim,   out_dim, bias=False)
+        self.W_v     = nn.Linear(in_dim,   out_dim, bias=False)
+        self.W_edge  = nn.Linear(edge_dim, heads,   bias=False)
+        self.scale   = self.d_head ** -0.5
+        self.drop    = nn.Dropout(dropout)
 
     def forward(self, x, edge_index, edge_attr):
         src_idx, dst_idx = edge_index[0], edge_index[1]
@@ -302,41 +301,54 @@ class ManualGATConv(nn.Module):
         D = self.d_head
         E = src_idx.size(0)
 
-        # Project to (N, H, D)
-        x_src = self.W_src(x).view(N, H, D)
-        x_dst = self.W_dst(x).view(N, H, D)
+        # Linear projections — all (N, H*D)
+        Q = self.W_q(x).view(N, H, D)   # queries
+        K = self.W_k(x).view(N, H, D)   # keys
+        V = self.W_v(x).view(N, H, D)   # values
 
-        # Gather edge endpoints
-        e_src = x_src[src_idx]   # (E, H, D)
-        e_dst = x_dst[dst_idx]   # (E, H, D)
+        # Gather src/dst
+        Q_src = Q[src_idx]   # (E, H, D)
+        K_dst = K[dst_idx]   # (E, H, D)
+        V_src = V[src_idx]   # (E, H, D)
 
-        # Sum over D dimension to get (E, H)
-        combined = (e_src + e_dst)                    # (E, H, D)
-        alpha    = (combined * self.att.view(1, H, 1)).sum(dim=2)  # (E, H)
+        # Attention scores (E, H)
+        scores = (Q_src * K_dst).sum(dim=2) * self.scale   # (E, H)
+        e_feat = self.W_edge(edge_attr.float())             # (E, H)
+        scores = scores + e_feat
 
-        # Add edge type contribution
-        e_feat = self.W_edge(edge_attr)               # (E, H)
-        alpha  = alpha + e_feat                        # (E, H)
-        alpha  = torch.nn.functional.leaky_relu(alpha, 0.2)
-        alpha  = alpha - alpha.max(dim=0, keepdim=True).values
-        alpha  = torch.exp(alpha)                      # (E, H)
+        # Per-edge softmax via stable exp
+        scores = scores - scores.max()
+        scores = torch.exp(scores)                          # (E, H)
+        scores = self.drop(scores)
 
-        # Normalise per destination node
-        denom  = torch.zeros(N, H, device=x.device, dtype=alpha.dtype)
-        idx_2d = dst_idx.unsqueeze(1).expand(E, H)    # (E, H)
-        denom.scatter_add_(0, idx_2d, alpha)
-        denom  = denom.clamp(min=1e-6)
+        # Normalize: sum scores per destination node
+        # Use loop over heads to avoid scatter_add_ dimension issues
+        out = torch.zeros(N, H, D, device=x.device, dtype=x.dtype)
+        norm = torch.zeros(N, H, device=x.device, dtype=x.dtype)
 
-        alpha_norm = self.drop(alpha / denom[dst_idx]) # (E, H)
+        for h in range(H):
+            s_h   = scores[:, h]                           # (E,)
+            v_h   = V_src[:, h, :]                         # (E, D)
+            msg_h = v_h * s_h.unsqueeze(1)                 # (E, D)
 
-        # Aggregate messages (E, H, D) → (N, H*D)
-        msgs   = (e_src * alpha_norm.unsqueeze(2))     # (E, H, D)
-        msgs   = msgs.reshape(E, H * D)                # (E, H*D)
-        out    = torch.zeros(N, H * D, device=x.device, dtype=msgs.dtype)
-        idx_hd = dst_idx.unsqueeze(1).expand(E, H * D) # (E, H*D)
-        out.scatter_add_(0, idx_hd, msgs)
+            # scatter into (N, D)
+            out_h  = torch.zeros(N, D, device=x.device, dtype=x.dtype)
+            norm_h = torch.zeros(N,    device=x.device, dtype=x.dtype)
 
-        return out                                     # (N, H*D)                                  # (N, H*D)                             # (N, H*D)
+            out_h.scatter_add_(
+                0,
+                dst_idx.unsqueeze(1).expand(E, D),
+                msg_h
+            )
+            norm_h.scatter_add_(
+                0,
+                dst_idx,
+                s_h
+            )
+            norm_h = norm_h.clamp(min=1e-6)
+            out[:, h, :] = out_h / norm_h.unsqueeze(1)
+
+        return out.reshape(N, H * D)                       # (N, H*D)                                 # (N, H*D)                                  # (N, H*D)                             # (N, H*D)
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=128, n_classes=4, n_layers=3):
