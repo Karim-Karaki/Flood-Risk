@@ -353,18 +353,33 @@ class ManualGATConv(nn.Module):
 class HydroGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=128, n_classes=4, n_layers=3):
         super().__init__()
+        
+        # hidden_dim must be divisible by heads
+        # heads=4, so hidden_dim must be multiple of 4
+        assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4"
+        
         self.input_proj = nn.Sequential(
             nn.Linear(node_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.LayerNorm(hidden_dim),
         )
-        self.gat_layers  = nn.ModuleList([
-            ManualGATConv(hidden_dim, hidden_dim, heads=4, edge_dim=1, dropout=0.2)
+        
+        # Each GAT layer: in=hidden_dim, out=hidden_dim, heads=4
+        # out_dim per head = hidden_dim // 4
+        self.gat_layers = nn.ModuleList([
+            ManualGATConv(
+                in_dim   = hidden_dim,
+                out_dim  = hidden_dim,   # total output = hidden_dim
+                heads    = 4,
+                edge_dim = 1,
+                dropout  = 0.2
+            )
             for _ in range(n_layers)
         ])
         self.layer_norms = nn.ModuleList([
             nn.LayerNorm(hidden_dim) for _ in range(n_layers)
         ])
+        
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(inplace=True),
@@ -373,9 +388,12 @@ class HydroGNN(nn.Module):
         )
 
     def forward(self, x, edge_index, edge_attr):
-        x = self.input_proj(x)
+        x = self.input_proj(x)              # (N, hidden_dim)
+        
         for gat, ln in zip(self.gat_layers, self.layer_norms):
-            x = ln(x + gat(x, edge_index, edge_attr))
+            gat_out = gat(x, edge_index, edge_attr)  # (N, hidden_dim)
+            x = ln(x + gat_out)                       # residual — same shape
+        
         return self.classifier(x)
 
 # ── 9. CNN patch encoder ──────────────────────────────────────────────
