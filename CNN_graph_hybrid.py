@@ -24,7 +24,7 @@ BATCH_SIZE = 512
 N_EPOCHS   = 40
 LR         = 3e-4
 TARGET_COL = 'risk_0_2m'
-BASIN_SIZE = 50   # 50x50 pixels = 1km x 1km per node
+BASIN_SIZE = 100   # 50x50 pixels = 1km x 1km per node
 
 FEATURE_COLS = [
     'dtm_zscore', 'log_flow_acc', 'imd', 'waw',
@@ -419,7 +419,7 @@ print(f"Val nodes:   {val_mask.sum().item():,}")
 print(f"Test nodes:  {vm_n.sum().item():,}")
 
 # ── 12. Model setup ───────────────────────────────────────────────────
-model = HybridCNNGNN(N_CHANNELS, cnn_dim=64, gnn_hidden=128, n_classes=4).to(device)
+model = HybridCNNGNN(N_CHANNELS, cnn_dim=32, gnn_hidden=64, n_classes=4).to(device)
 print(f"\nModel parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 # Class weights
@@ -439,7 +439,7 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS)
 scaler    = torch.amp.GradScaler('cuda')
 
 # Move everything to device
-patches_s_dev  = patches_s.to(device)
+patches_s_cpu  = patches_s
 x_s_dev        = x_s.to(device)
 ei_s_dev       = ei_s.to(device)
 ea_s_dev       = ea_s.to(device)
@@ -447,7 +447,7 @@ y_s_dev        = y_s.to(device)
 train_mask_dev = train_mask.to(device)
 val_mask_dev   = val_mask.to(device)
 
-patches_n_dev  = patches_n.to(device)
+patches_n_cpu  = patches_n
 x_n_dev        = x_n.to(device)
 ei_n_dev       = ei_n.to(device)
 ea_n_dev       = ea_n.to(device)
@@ -462,6 +462,21 @@ print("-" * 50)
 best_val_acc = 0
 best_state   = None
 
+def forward_chunked(model, patches, x_node, edge_index, edge_attr,
+                    device, chunk_size=128):
+    cnn_feats = []
+    with torch.no_grad() if not model.training else torch.enable_grad():
+        for i in range(0, patches.shape[0], chunk_size):
+            chunk = patches[i:i+chunk_size].to(device)
+            with torch.amp.autocast('cuda'):
+                feats = model.cnn(chunk)
+            cnn_feats.append(feats)
+            del chunk
+    cnn_feats  = torch.cat(cnn_feats, dim=0)
+    node_feats = torch.cat([cnn_feats, x_node], dim=1)
+    with torch.amp.autocast('cuda'):
+        return model.gnn(node_feats, edge_index, edge_attr)
+
 for epoch in range(1, N_EPOCHS + 1):
     t0 = time.time()
 
@@ -470,7 +485,7 @@ for epoch in range(1, N_EPOCHS + 1):
     optimizer.zero_grad()
 
     with torch.amp.autocast('cuda'):
-        logits = model(patches_s_dev, x_s_dev, ei_s_dev, ea_s_dev)
+        logits = forward_chunked(model, patches_s_cpu, x_s_dev, ei_s_dev, ea_s_dev, device)
         tr_log = logits[train_mask_dev]
         tr_lbl = y_s_dev[train_mask_dev]
         valid  = tr_lbl >= 0
@@ -487,7 +502,8 @@ for epoch in range(1, N_EPOCHS + 1):
     # ── Validate ───────────────────────────────────────────────────────
     model.eval()
     with torch.no_grad(), torch.amp.autocast('cuda'):
-        logits  = model(patches_s_dev, x_s_dev, ei_s_dev, ea_s_dev)
+        logits  = forward_chunked(model, patches_s_cpu, x_s_dev, ei_s_dev, ea_s_dev, device)
+
         vl_log  = logits[val_mask_dev]
         vl_lbl  = y_s_dev[val_mask_dev]
         valid_v = vl_lbl >= 0
@@ -509,7 +525,7 @@ model.eval()
 
 with torch.no_grad(), torch.amp.autocast('cuda'):
     # Severn val
-    logits  = model(patches_s_dev, x_s_dev, ei_s_dev, ea_s_dev)
+    logits  = forward_chunked(model, patches_s_cpu, x_s_dev, ei_s_dev, ea_s_dev, device)
     vl_log  = logits[val_mask_dev]
     vl_lbl  = y_s_dev[val_mask_dev]
     valid_v = vl_lbl >= 0
@@ -517,7 +533,7 @@ with torch.no_grad(), torch.amp.autocast('cuda'):
     vl_true  = vl_lbl[valid_v].cpu().numpy()
 
     # Northumbria test
-    logits   = model(patches_n_dev, x_n_dev, ei_n_dev, ea_n_dev)
+    logits   = forward_chunked(model, patches_n_cpu, x_n_dev, ei_n_dev, ea_n_dev, device)
     ts_log   = logits[vm_n_dev]
     ts_lbl   = y_n_dev[vm_n_dev]
     valid_t  = ts_lbl >= 0
