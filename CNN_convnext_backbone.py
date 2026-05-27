@@ -253,8 +253,7 @@ class FloodCNN(nn.Module):
         super().__init__()
         assert len(dims) == len(depths)
 
-        # Proper downsample pipeline:
-        # input -> dims[0] -> dims[1] -> dims[2]
+        # Three explicit downsampling stages
         self.downsample_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_channels, dims[0], kernel_size=4, stride=2, padding=1),
@@ -291,17 +290,6 @@ class FloodCNN(nn.Module):
 
         x = x.mean(dim=(-2, -1))   # global average pooling
         x = self.norm(x)
-        x = self.head(x)
-        return x
-
-    def forward(self, x):
-        x = self.stem(x)
-        stage_i = 0
-        # Manual traversal to keep the structure explicit.
-        for module in self.stages:
-            x = module(x)
-        x = x.mean(dim=(-2, -1))
-        x = self.head_norm(x)
         x = self.head(x)
         return x
 
