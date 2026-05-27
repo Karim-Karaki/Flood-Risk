@@ -300,30 +300,31 @@ class ManualGATConv(nn.Module):
         x_src = self.W_src(x).view(N, H, D)
         x_dst = self.W_dst(x).view(N, H, D)
 
-        e_src  = x_src[src_idx]
-        e_dst  = x_dst[dst_idx]
-        e_feat = self.W_edge(edge_attr)
+        e_src  = x_src[src_idx]                                # (E, H, D)
+        e_dst  = x_dst[dst_idx]                                # (E, H, D)
+        e_feat = self.W_edge(edge_attr)                         # (E, H)
 
-        alpha  = (self.att * (e_src + e_dst)).sum(-1) + e_feat
+        alpha  = (self.att * (e_src + e_dst)).sum(-1) + e_feat  # (E, H)
         alpha  = torch.nn.functional.leaky_relu(alpha, 0.2)
         alpha  = alpha - alpha.max()
-        alpha  = torch.exp(alpha)
+        alpha  = torch.exp(alpha)                               # (E, H)
 
+        # ── FIX: use 2D scatter (N, H) not 3D ────────────────────────────
         denom  = torch.zeros(N, H, device=x.device)
-        # ── FIX: clamp edge indices to valid range ────────────────────────
-        dst_clamped = dst_idx.clamp(0, N - 1)
-        src_clamped = src_idx.clamp(0, N - 1)
-        denom.scatter_add_(0, dst_clamped.unsqueeze(1).expand(-1, H), alpha)
+        idx_2d = dst_idx.unsqueeze(1).expand(-1, H)             # (E, H)
+        denom.scatter_add_(0, idx_2d, alpha)
         denom  = denom.clamp(min=1e-6)
 
-        alpha_norm = self.drop(alpha / denom[dst_clamped])
+        alpha_norm = self.drop(alpha / denom[dst_idx])          # (E, H)
 
-        msgs = x_src * alpha_norm.unsqueeze(-1)
-        out  = torch.zeros(N, H, D, device=x.device)
-        out.scatter_add_(0, dst_clamped.view(-1,1,1).expand_as(msgs), msgs)
+        # ── FIX: aggregate messages correctly ────────────────────────────
+        # msgs: (E, H*D) then scatter into (N, H*D)
+        msgs   = (x_src * alpha_norm.unsqueeze(-1)).view(-1, H * D)  # (E, H*D)
+        out    = torch.zeros(N, H * D, device=x.device)
+        idx_hd = dst_idx.unsqueeze(1).expand(-1, H * D)              # (E, H*D)
+        out.scatter_add_(0, idx_hd, msgs)
 
-        return out.view(N, H * D)                            # (N, out_dim)
-
+        return out                                              # (N, H*D)
 # ── 8. GNN ────────────────────────────────────────────────────────────
 class HydroGNN(nn.Module):
     def __init__(self, node_dim, hidden_dim=128, n_classes=4, n_layers=3):
