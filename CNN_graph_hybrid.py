@@ -24,7 +24,7 @@ BATCH_SIZE = 512
 N_EPOCHS = 60
 LR       = 1e-3
 TARGET_COL = 'risk_0_2m'
-BASIN_SIZE = 20   # 50x50 pixels = 1km x 1km per node
+BASIN_SIZE = 30   # 50x50 pixels = 1km x 1km per node
 
 FEATURE_COLS = [
     'dtm_zscore', 'log_flow_acc', 'imd', 'waw',
