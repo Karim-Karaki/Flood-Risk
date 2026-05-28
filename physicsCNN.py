@@ -23,7 +23,7 @@ HALF       = PATCH_SIZE // 2
 BATCH_SIZE = 4096
 N_EPOCHS   = 50
 LR         = 3e-4
-TARGET_COL = 'risk_0_2m'
+TARGET_COL = 'risk_1_2m'
 
 LAMBDA_FLOW = 0.5
 LAMBDA_ELEV = 0.3
