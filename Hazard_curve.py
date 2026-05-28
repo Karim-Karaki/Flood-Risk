@@ -36,11 +36,11 @@ N_DEPTHS   = len(DEPTH_COLS)
 # Class 4 (High)     : >3.3% annual chance  → 0.05
 # NaN / 0            : no risk              → 0.0
 CLASS_TO_PROB = {
-    0:   0.0,
-    1:   0.001,
-    2:   0.005,
-    3:   0.02,
-    4:   0.05,
+    0: 0.0,
+    1: 0.001,   # Very Low  < 0.1% annual
+    2: 0.01,    # Low       0.1-1%
+    3: 0.033,   # Medium    1-3.3%
+    4: 0.10,    # High      > 3.3%
 }
 
 FEATURE_COLS = [
@@ -129,6 +129,11 @@ def build_hazard_targets(df):
         targets[:, d] = np.minimum(targets[:, d], targets[:, d-1])
 
     return targets
+print("\nHazard target distribution check:")
+classes_check = hazard_to_class(hazard_s_arr)
+unique, counts = np.unique(classes_check, return_counts=True)
+for u, c in zip(unique, counts):
+    print(f"  Class {u}: {c:,} ({c/len(classes_check)*100:.1f}%)")
 
 print("Processing Severn...")
 df_s = ds_terrain_severn.to_dataframe().reset_index()
@@ -381,6 +386,8 @@ class HazardLoss(nn.Module):
         self.lambda_ord  = lambda_ord
         self.mse         = nn.MSELoss()
         self.ce          = nn.CrossEntropyLoss()
+        self.thresholds = torch.tensor([0.001, 0.01, 0.033])
+
 
         # Probability thresholds for class assignment
         # Class 1: p < 0.002
@@ -390,7 +397,6 @@ class HazardLoss(nn.Module):
         self.thresholds = torch.tensor([0.002, 0.01, 0.035])
 
     def prob_to_class(self, p):
-        """Convert exceedance probability to ordinal class 0-3."""
         thresholds = self.thresholds.to(p.device)
         c = torch.zeros(p.shape[0], dtype=torch.long, device=p.device)
         c[p >= thresholds[0]] = 1
@@ -446,15 +452,11 @@ class HazardLoss(nn.Module):
 
 # ── 9. Evaluation: convert hazard curve back to risk classes ──────────
 def hazard_to_class(hazard_curve_np, depth_idx=0):
-    """
-    Convert predicted hazard curve to ordinal class for evaluation.
-    Uses primary depth (0.2m) by default.
-    """
     p = hazard_curve_np[:, depth_idx]
     classes = np.zeros(len(p), dtype=int)
-    classes[p >= 0.002] = 1
-    classes[p >= 0.01]  = 2
-    classes[p >= 0.035] = 3
+    classes[p >= 0.001]  = 1   # Very Low
+    classes[p >= 0.01]   = 2   # Low
+    classes[p >= 0.033]  = 3   # Medium
     return classes
 
 # ── 10. Build datasets ────────────────────────────────────────────────
