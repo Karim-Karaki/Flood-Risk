@@ -21,7 +21,7 @@ DATA_DIR   = '/workspace/Data-Flood/'
 PATCH_SIZE = 11
 HALF       = PATCH_SIZE // 2
 BATCH_SIZE = 4096
-N_EPOCHS   = 50
+N_EPOCHS   = 30
 LR         = 3e-4
 
 # All 5 depth levels as multi-output targets
