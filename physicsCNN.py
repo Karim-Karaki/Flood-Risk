@@ -518,3 +518,187 @@ print(f"Physics CNN    — Severn: {f1_sev:.3f} | Northumbria: {f1_nor:.3f}")
 
 torch.save(best_state, '/workspace/Flood-Risk/flood_physics_cnn.pt')
 print("\nSaved to /workspace/Flood-Risk/flood_physics_cnn.pt")
+# ── 12. Visual comparison maps ────────────────────────────────────────
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import Patch
+
+# Risk colormap: Very Low=green, Low=yellow, Medium=orange, High=red
+RISK_CMAP   = mcolors.ListedColormap(['#2ecc71','#f1c40f','#e67e22','#e74c3c'])
+RISK_BOUNDS = [-0.5, 0.5, 1.5, 2.5, 3.5]
+RISK_NORM   = mcolors.BoundaryNorm(RISK_BOUNDS, RISK_CMAP.N)
+RISK_LABELS = ['Very Low','Low','Medium','High']
+
+def get_pred_map(model, feat_grid, label_grid, device,
+                 patch_size=11, batch_size=8192):
+    """
+    Run inference on every valid pixel in the grid.
+    Returns pred_map (H, W) with predicted class 0-3, -1 where invalid.
+    """
+    half    = patch_size // 2
+    H, W, C = feat_grid.shape
+    pred_map = np.full((H, W), -1, dtype=np.int8)
+
+    # Collect all valid positions
+    ys, xs = np.where(
+        (label_grid >= 0) &
+        (np.arange(H)[:, None] >= half) &
+        (np.arange(H)[:, None] <  H - half) &
+        (np.arange(W)[None, :] >= half) &
+        (np.arange(W)[None, :] <  W - half)
+    )
+    positions = list(zip(ys.tolist(), xs.tolist()))
+    print(f"  Running inference on {len(positions):,} pixels...")
+
+    model.eval()
+    all_preds = []
+
+    with torch.no_grad():
+        for start in range(0, len(positions), batch_size):
+            batch_pos = positions[start:start+batch_size]
+            patches   = np.stack([
+                feat_grid[i-half:i+half+1, j-half:j+half+1, :]
+                .transpose(2, 0, 1)
+                for i, j in batch_pos
+            ])
+            patches_t = torch.from_numpy(patches).to(device)
+            with torch.amp.autocast('cuda'):
+                logits = model(patches_t)
+            preds = logits.argmax(1).cpu().numpy()
+            all_preds.extend(preds)
+
+    for (i, j), p in zip(positions, all_preds):
+        pred_map[i, j] = p
+
+    return pred_map
+
+def plot_comparison(true_grid, pred_grid, title, save_path):
+    """
+    Side-by-side: ground truth vs predicted risk map.
+    Only shows valid pixels.
+    """
+    # Mask invalid pixels
+    true_show = np.where(true_grid >= 0, true_grid, np.nan).astype(float)
+    pred_show = np.where(pred_grid >= 0, pred_grid, np.nan).astype(float)
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 8))
+    fig.suptitle(title, fontsize=16, fontweight='bold')
+
+    # Ground truth
+    im0 = axes[0].imshow(true_show, cmap=RISK_CMAP, norm=RISK_NORM,
+                          interpolation='nearest', aspect='auto')
+    axes[0].set_title('Ground Truth', fontsize=13)
+    axes[0].axis('off')
+
+    # Prediction
+    im1 = axes[1].imshow(pred_show, cmap=RISK_CMAP, norm=RISK_NORM,
+                          interpolation='nearest', aspect='auto')
+    axes[1].set_title('Physics CNN Prediction', fontsize=13)
+    axes[1].axis('off')
+
+    # Difference map
+    diff = np.full_like(true_show, np.nan)
+    valid = (true_grid >= 0) & (pred_grid >= 0)
+    diff[valid] = (pred_grid[valid] == true_grid[valid]).astype(float)
+
+    diff_cmap = mcolors.ListedColormap(['#e74c3c','#2ecc71'])
+    im2 = axes[2].imshow(diff, cmap=diff_cmap, vmin=0, vmax=1,
+                          interpolation='nearest', aspect='auto')
+    axes[2].set_title('Correct (green) / Wrong (red)', fontsize=13)
+    axes[2].axis('off')
+
+    # Accuracy annotation on diff map
+    acc  = accuracy_score(true_grid[valid], pred_grid[valid])
+    f1   = f1_score(true_grid[valid], pred_grid[valid],
+                    average='weighted', zero_division=0)
+    axes[2].set_xlabel(f'Accuracy: {acc:.3f} | Weighted F1: {f1:.3f}',
+                       fontsize=11)
+
+    # Shared legend
+    legend_patches = [
+        Patch(color=RISK_CMAP(i/(len(RISK_LABELS)-1)), label=RISK_LABELS[i])
+        for i in range(len(RISK_LABELS))
+    ]
+    fig.legend(handles=legend_patches, loc='lower center',
+               ncol=4, fontsize=11, frameon=True,
+               bbox_to_anchor=(0.5, 0.01))
+
+    plt.tight_layout(rect=[0, 0.06, 1, 0.96])
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+def plot_class_distribution(true_grid, pred_grid, title, save_path):
+    """Bar chart comparing true vs predicted class distribution."""
+    valid  = (true_grid >= 0) & (pred_grid >= 0)
+    true_v = true_grid[valid]
+    pred_v = pred_grid[valid]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+
+    colors = ['#2ecc71','#f1c40f','#e67e22','#e74c3c']
+    x      = np.arange(4)
+    width  = 0.35
+
+    for ax, data, label in zip(axes, [true_v, pred_v], ['Ground Truth','Prediction']):
+        counts = [(data == c).sum() for c in range(4)]
+        total  = sum(counts)
+        pcts   = [c/total*100 for c in counts]
+        bars   = ax.bar(x, pcts, color=colors, edgecolor='white', linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(RISK_LABELS, fontsize=11)
+        ax.set_ylabel('% of pixels', fontsize=11)
+        ax.set_title(label, fontsize=12)
+        ax.set_ylim(0, max(pcts) * 1.2)
+        for bar, pct in zip(bars, pcts):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                    f'{pct:.1f}%', ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {save_path}")
+
+# ── Generate maps ─────────────────────────────────────────────────────
+print("\nGenerating prediction maps...")
+OUT_DIR = '/workspace/Flood-Risk/'
+
+print("Severn inference...")
+pred_map_s = get_pred_map(model, grid_s, labels_s, device)
+
+print("Northumbria inference...")
+pred_map_n = get_pred_map(model, grid_n, labels_n, device)
+
+print("Plotting Severn...")
+plot_comparison(
+    labels_s, pred_map_s,
+    'Severn — Physics CNN (Seen Region)',
+    OUT_DIR + 'map_severn_physics_cnn.png'
+)
+plot_class_distribution(
+    labels_s, pred_map_s,
+    'Severn Class Distribution — Physics CNN',
+    OUT_DIR + 'dist_severn_physics_cnn.png'
+)
+
+print("Plotting Northumbria...")
+plot_comparison(
+    labels_n, pred_map_n,
+    'Northumbria — Physics CNN (Unseen Region)',
+    OUT_DIR + 'map_northumbria_physics_cnn.png'
+)
+plot_class_distribution(
+    labels_n, pred_map_n,
+    'Northumbria Class Distribution — Physics CNN',
+    OUT_DIR + 'dist_northumbria_physics_cnn.png'
+)
+
+print("\nAll maps saved to /workspace/Flood-Risk/")
+print("Files:")
+print("  map_severn_physics_cnn.png       — spatial prediction vs truth")
+print("  map_northumbria_physics_cnn.png  — spatial prediction vs truth")
+print("  dist_severn_physics_cnn.png      — class distribution comparison")
+print("  dist_northumbria_physics_cnn.png — class distribution comparison")
