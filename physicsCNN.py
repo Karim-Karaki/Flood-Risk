@@ -4,7 +4,7 @@ import torch.optim as optim
 import numpy as np
 import pandas as pd
 import xarray as xr
-from sklearn.metrics import classification_report, accuracy_score, f1_score
+from sklearn.metrics import classification_report, accuracy_score, f1_score, cohen_kappa_score
 from scipy.spatial import cKDTree
 from torch.utils.data import Dataset, DataLoader
 import time
@@ -39,7 +39,49 @@ DTM_IDX      = FEATURE_COLS.index('dtm_zscore')
 FLOW_ACC_IDX = FEATURE_COLS.index('log_flow_acc')
 N_CHANNELS   = len(FEATURE_COLS)
 
-# ── 2. Load data ──────────────────────────────────────────────────────
+# ── 2. Metrics helper ─────────────────────────────────────────────────
+def compute_metrics(y_true, y_pred, label):
+    """
+    Compute and print metrics table matching competition format:
+    QWK | macro_f1 | weighted_f1 | f1_class_0..3 | N
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    N      = len(y_true)
+
+    qwk      = cohen_kappa_score(y_true, y_pred, weights='quadratic')
+    macro_f1 = f1_score(y_true, y_pred, average='macro',    zero_division=0)
+    wf1      = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    acc      = accuracy_score(y_true, y_pred)
+    per_cls  = f1_score(y_true, y_pred, average=None,       zero_division=0, labels=[0,1,2,3])
+
+    # Table header
+    sep  = "| --------- | ------ | -------- | ----------- | ---------- | ---------- | ---------- | ---------- | --------- |"
+    hdr  = "| metric    | qwk    | macro_f1 | weighted_f1 | f1_class_0 | f1_class_1 | f1_class_2 | f1_class_3 | N         |"
+
+    print(f"\n=== {label} ===")
+    print(hdr)
+    print(sep)
+    print(f"| {TARGET_COL:<9} "
+          f"| {qwk:.4f} "
+          f"| {macro_f1:.4f}   "
+          f"| {wf1:.4f}      "
+          f"| {per_cls[0]:.4f}     "
+          f"| {per_cls[1]:.4f}     "
+          f"| {per_cls[2]:.4f}     "
+          f"| {per_cls[3]:.4f}     "
+          f"| {N:<9} |")
+    print(sep)
+
+    print(f"\nAccuracy: {acc:.4f}")
+    print(classification_report(
+        y_true, y_pred,
+        target_names=['Very Low','Low','Medium','High'],
+        zero_division=0
+    ))
+    return qwk, macro_f1, wf1, per_cls, acc
+
+# ── 3. Load data ──────────────────────────────────────────────────────
 print("\nLoading datasets...")
 ds_terrain_severn      = xr.open_dataset(DATA_DIR + 'Copy of Copy of flood_risk_terrain_severn.nc',      engine='netcdf4')
 ds_terrain_northumbria = xr.open_dataset(DATA_DIR + 'Copy of Copy of flood_risk_terrain_northumbria.nc', engine='netcdf4')
@@ -47,7 +89,7 @@ ds_era5_severn         = xr.open_dataset(DATA_DIR + 'Copy of Copy of era5_land_s
 ds_era5_northumbria    = xr.open_dataset(DATA_DIR + 'Copy of Copy of era5_land_northumbria.nc',           engine='netcdf4')
 print("Loaded.")
 
-# ── 3. Feature engineering ────────────────────────────────────────────
+# ── 4. Feature engineering ────────────────────────────────────────────
 risk_cols = ['risk_0_2m','risk_0_3m','risk_0_6m','risk_0_9m','risk_1_2m']
 
 def filter_risk_pixels(df):
@@ -119,7 +161,7 @@ df_n = add_weather_zscore(df_n, ['tp_p99','sro_p95','swvl1_min','max_rolling5_tp
 df_n = df_n.reset_index(drop=True)
 print(f"Northumbria: {len(df_n):,} pixels")
 
-# ── 4. Build raster grid ──────────────────────────────────────────────
+# ── 5. Build raster grid ──────────────────────────────────────────────
 def df_to_grid(df, feature_cols, target_col, resolution=20):
     df = df.copy()
     df['yr'] = (df['y'] / resolution).round().astype(int)
@@ -157,7 +199,7 @@ print("Building Northumbria grid...")
 df_n_clean = df_n.dropna(subset=FEATURE_COLS + [TARGET_COL]).copy().reset_index(drop=True)
 grid_n, labels_n = df_to_grid(df_n_clean, FEATURE_COLS, TARGET_COL)
 
-# ── 5. Physics-aware patch dataset ────────────────────────────────────
+# ── 6. Physics-aware patch dataset ────────────────────────────────────
 class PhysicsPatchDataset(Dataset):
     def __init__(self, feat_grid, label_grid, patch_size=11,
                  augment=False, val_fraction=0.0, is_val=False, seed=42):
@@ -202,9 +244,7 @@ class PhysicsPatchDataset(Dataset):
         center_dtm  = float(self.feat[i, j, DTM_IDX])
         center_flow = float(self.feat[i, j, FLOW_ACC_IDX])
 
-        neighbor_dtm  = []
-        neighbor_flow = []
-        neighbor_lbl  = []
+        neighbor_dtm, neighbor_flow, neighbor_lbl = [], [], []
         for di in [-1, 0, 1]:
             for dj in [-1, 0, 1]:
                 if di == 0 and dj == 0:
@@ -229,7 +269,7 @@ class PhysicsPatchDataset(Dataset):
             torch.tensor(neighbor_lbl,  dtype=torch.long),
         )
 
-# ── 6. Physics-informed loss ──────────────────────────────────────────
+# ── 7. Physics-informed loss ──────────────────────────────────────────
 class PhysicsInformedLoss(nn.Module):
     def __init__(self, lambda_flow=0.5, lambda_elev=0.3, lambda_acc=0.3):
         super().__init__()
@@ -240,10 +280,9 @@ class PhysicsInformedLoss(nn.Module):
 
     def forward(self, logits, labels,
                 center_physics, neighbor_dtm, neighbor_flow, neighbor_lbl):
-        loss_ce = self.ce(logits, labels)
-
+        loss_ce    = self.ce(logits, labels)
         probs      = torch.softmax(logits, dim=1)
-        class_vals = torch.tensor([0., 1., 2., 3.], device=logits.device)
+        class_vals = torch.tensor([0.,1.,2.,3.], device=logits.device)
         pred_risk  = (probs * class_vals).sum(dim=1)
 
         center_dtm  = center_physics[:, 0]
@@ -258,8 +297,7 @@ class PhysicsInformedLoss(nn.Module):
             n_dtm  = neighbor_dtm[:, k]
             n_flow = neighbor_flow[:, k]
             n_lbl  = neighbor_lbl[:, k]
-
-            valid = n_lbl >= 0
+            valid  = n_lbl >= 0
             if valid.sum() == 0:
                 continue
 
@@ -270,26 +308,20 @@ class PhysicsInformedLoss(nn.Module):
             n_dtm_v    = n_dtm[valid]
             n_flow_v   = n_flow[valid]
 
-            # Flow: downstream neighbor should have >= risk
             downstream = n_flow_v > c_flow
             if downstream.sum() > 0:
                 loss_flow = loss_flow + torch.clamp(
-                    c_risk[downstream] - n_risk_val[downstream], min=0.0
-                ).mean()
+                    c_risk[downstream] - n_risk_val[downstream], min=0.0).mean()
 
-            # Elevation: lower pixel should have >= risk
             lower = n_dtm_v > c_dtm
             if lower.sum() > 0:
                 loss_elev = loss_elev + torch.clamp(
-                    n_risk_val[lower] - c_risk[lower], min=0.0
-                ).mean()
+                    n_risk_val[lower] - c_risk[lower], min=0.0).mean()
 
-            # Flow_acc: higher flow_acc should have >= risk
             high_acc = c_flow > n_flow_v
             if high_acc.sum() > 0:
                 loss_acc = loss_acc + torch.clamp(
-                    n_risk_val[high_acc] - c_risk[high_acc], min=0.0
-                ).mean()
+                    n_risk_val[high_acc] - c_risk[high_acc], min=0.0).mean()
 
             n_valid += 1
 
@@ -302,10 +334,9 @@ class PhysicsInformedLoss(nn.Module):
                  + self.lambda_flow * loss_flow
                  + self.lambda_elev * loss_elev
                  + self.lambda_acc  * loss_acc)
-
         return total, loss_ce, loss_flow, loss_elev, loss_acc
 
-# ── 7. Model ──────────────────────────────────────────────────────────
+# ── 8. Model ──────────────────────────────────────────────────────────
 class ResBlock(nn.Module):
     def __init__(self, ch):
         super().__init__()
@@ -346,7 +377,7 @@ class PhysicsCNN(nn.Module):
     def forward(self, x):
         return self.classifier(self.gap(self.encoder(x)))
 
-# ── 8. Build datasets ─────────────────────────────────────────────────
+# ── 9. Build datasets ─────────────────────────────────────────────────
 print("\nBuilding datasets...")
 print("Train:")
 train_ds = PhysicsPatchDataset(
@@ -374,27 +405,17 @@ def collate_fn(batch):
         torch.stack([b[5] for b in batch]),
     )
 
-train_loader = DataLoader(
-    train_ds, batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=8, pin_memory=True,
-    prefetch_factor=2, collate_fn=collate_fn
-)
-val_loader = DataLoader(
-    val_ds, batch_size=BATCH_SIZE*2, shuffle=False,
-    num_workers=8, pin_memory=True, collate_fn=collate_fn
-)
-test_loader = DataLoader(
-    test_ds, batch_size=BATCH_SIZE*2, shuffle=False,
-    num_workers=8, pin_memory=True, collate_fn=collate_fn
-)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,   shuffle=True,
+                          num_workers=8, pin_memory=True,
+                          prefetch_factor=2, collate_fn=collate_fn)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE*2, shuffle=False,
+                          num_workers=8, pin_memory=True, collate_fn=collate_fn)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE*2, shuffle=False,
+                          num_workers=8, pin_memory=True, collate_fn=collate_fn)
 
-# ── 9. Model setup ────────────────────────────────────────────────────
+# ── 10. Model setup ───────────────────────────────────────────────────
 model     = PhysicsCNN(N_CHANNELS, n_classes=4).to(device)
-criterion = PhysicsInformedLoss(
-    lambda_flow=LAMBDA_FLOW,
-    lambda_elev=LAMBDA_ELEV,
-    lambda_acc=LAMBDA_ACC
-)
+criterion = PhysicsInformedLoss(LAMBDA_FLOW, LAMBDA_ELEV, LAMBDA_ACC)
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
 scheduler = optim.lr_scheduler.OneCycleLR(
     optimizer, max_lr=LR,
@@ -405,18 +426,18 @@ scaler = torch.amp.GradScaler('cuda')
 
 print(f"\nModel parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-# ── 10. Training loop ─────────────────────────────────────────────────
+# ── 11. Training loop ─────────────────────────────────────────────────
 print(f"\nTraining for {N_EPOCHS} epochs...")
-print(f"{'Ep':>4} {'TrLoss':>8} {'CE':>7} {'Flow':>7} {'Elev':>7} {'TrAcc':>7} {'VlAcc':>7} {'VlF1':>7} {'Time':>7}")
-print("-" * 75)
+print(f"{'Ep':>4} {'TrLoss':>8} {'CE':>7} {'Flow':>7} {'Elev':>7} {'TrAcc':>7} {'VlAcc':>7} {'VlF1':>7} {'VlQWK':>7} {'Time':>7}")
+print("-" * 80)
 
-best_val_f1 = 0
-best_state  = None
+best_val_qwk = 0
+best_state   = None
 
 for epoch in range(1, N_EPOCHS + 1):
     t0 = time.time()
 
-    # ── Train ──────────────────────────────────────────────────────────
+    # Train
     model.train()
     tr_loss_sum = tr_ce_sum = tr_fl_sum = tr_el_sum = 0
     tr_correct  = tr_total  = 0
@@ -433,8 +454,7 @@ for epoch in range(1, N_EPOCHS + 1):
         with torch.amp.autocast('cuda'):
             logits = model(patches)
             loss, lce, lflow, lelev, lacc = criterion(
-                logits, labels, c_phys, n_dtm, n_flow, n_lbl
-            )
+                logits, labels, c_phys, n_dtm, n_flow, n_lbl)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -455,37 +475,37 @@ for epoch in range(1, N_EPOCHS + 1):
     tr_el   = tr_el_sum   / tr_total
     tr_acc  = tr_correct  / tr_total
 
-    # ── Validate ───────────────────────────────────────────────────────
+    # Validate
     model.eval()
-    vl_preds_all = []
-    vl_true_all  = []
+    vl_preds_all, vl_true_all = [], []
 
     with torch.no_grad():
         for patches, labels, c_phys, n_dtm, n_flow, n_lbl in val_loader:
             patches = patches.to(device, non_blocking=True)
-            labels  = labels.to(device,  non_blocking=True)
             with torch.amp.autocast('cuda'):
                 logits = model(patches)
             vl_preds_all.extend(logits.argmax(1).cpu().numpy())
-            vl_true_all.extend(labels.cpu().numpy())
+            vl_true_all.extend(labels.numpy())
 
     vl_acc = accuracy_score(vl_true_all, vl_preds_all)
     vl_f1  = f1_score(vl_true_all, vl_preds_all, average='weighted', zero_division=0)
+    vl_qwk = cohen_kappa_score(vl_true_all, vl_preds_all, weights='quadratic')
     elapsed = time.time() - t0
 
-    marker = ' ◄' if vl_f1 > best_val_f1 else ''
-    if vl_f1 > best_val_f1:
-        best_val_f1 = vl_f1
-        best_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    marker = ' ◄' if vl_qwk > best_val_qwk else ''
+    if vl_qwk > best_val_qwk:
+        best_val_qwk = vl_qwk
+        best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     print(f"{epoch:>4} {tr_loss:>8.4f} {tr_ce:>7.4f} {tr_fl:>7.4f} "
-          f"{tr_el:>7.4f} {tr_acc:>7.3f} {vl_acc:>7.3f} {vl_f1:>7.3f} {elapsed:>6.1f}s{marker}")
+          f"{tr_el:>7.4f} {tr_acc:>7.3f} {vl_acc:>7.3f} "
+          f"{vl_f1:>7.3f} {vl_qwk:>7.3f} {elapsed:>6.1f}s{marker}")
 
-# ── 11. Final evaluation ──────────────────────────────────────────────
+# ── 12. Final evaluation ──────────────────────────────────────────────
 model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 model.eval()
 
-def evaluate_loader(loader, label):
+def run_inference(loader):
     all_pred, all_true = [], []
     with torch.no_grad():
         for patches, labels, c_phys, n_dtm, n_flow, n_lbl in loader:
@@ -494,54 +514,51 @@ def evaluate_loader(loader, label):
                 logits = model(patches)
             all_pred.extend(logits.argmax(1).cpu().numpy())
             all_true.extend(labels.numpy())
+    return np.array(all_true), np.array(all_pred)
 
-    acc = accuracy_score(all_true, all_pred)
-    f1  = f1_score(all_true, all_pred, average='weighted', zero_division=0)
+sev_true, sev_pred = run_inference(val_loader)
+nor_true, nor_pred = run_inference(test_loader)
 
-    print(f"\n── Physics CNN: {label} ──")
-    print(f"Accuracy: {acc:.3f} | Weighted F1: {f1:.3f}")
-    print(classification_report(
-        all_true, all_pred,
-        target_names=['Very Low','Low','Medium','High'],
-        zero_division=0
-    ))
-    return acc, f1
+qwk_sev, mf1_sev, wf1_sev, pc_sev, acc_sev = compute_metrics(sev_true, sev_pred, "Severn val (seen)")
+qwk_nor, mf1_nor, wf1_nor, pc_nor, acc_nor = compute_metrics(nor_true, nor_pred, "Northumbria test (unseen)")
 
-acc_sev, f1_sev = evaluate_loader(val_loader,  "Severn val (seen)")
-acc_nor, f1_nor = evaluate_loader(test_loader, "Northumbria test (unseen)")
+# Comparison table
+print("\n=== Model progression ===")
+hdr = "| model            | region       | qwk    | macro_f1 | weighted_f1 | f1_c0  | f1_c1  | f1_c2  | f1_c3  |"
+sep = "| ---------------- | ------------ | ------ | -------- | ----------- | ------ | ------ | ------ | ------ |"
+print(hdr)
+print(sep)
+rows = [
+    ("XGBoost v4",    "Severn",       "~0.52", "~0.43", "0.56", "-", "-", "-", "-"),
+    ("XGBoost v4",    "Northumbria",  "~0.35", "~0.28", "0.37", "-", "-", "-", "-"),
+    ("CNN v2",        "Severn",       "~0.46", "~0.46", "0.51", "-", "-", "-", "-"),
+    ("CNN v2",        "Northumbria",  "~0.28", "~0.37", "0.38", "-", "-", "-", "-"),
+]
+for r in rows:
+    print(f"| {r[0]:<16} | {r[1]:<12} | {r[2]:<6} | {r[3]:<8} | {r[4]:<11} | {r[5]:<6} | {r[6]:<6} | {r[7]:<6} | {r[8]:<6} |")
+print(f"| {'Physics CNN':<16} | {'Severn':<12} | {qwk_sev:.4f} | {mf1_sev:.4f}   | {wf1_sev:.4f}      | {pc_sev[0]:.4f} | {pc_sev[1]:.4f} | {pc_sev[2]:.4f} | {pc_sev[3]:.4f} |")
+print(f"| {'Physics CNN':<16} | {'Northumbria':<12} | {qwk_nor:.4f} | {mf1_nor:.4f}   | {wf1_nor:.4f}      | {pc_nor[0]:.4f} | {pc_nor[1]:.4f} | {pc_nor[2]:.4f} | {pc_nor[3]:.4f} |")
+print(sep)
 
-print("\n── Model progression (Weighted F1) ──")
-print(f"XGBoost v4     — Severn: 0.56 | Northumbria: 0.37")
-print(f"CNN v2         — Severn: 0.51 | Northumbria: 0.38")
-print(f"Hybrid CNN-GNN — Severn: 0.40 | Northumbria: 0.22")
-print(f"Physics CNN    — Severn: {f1_sev:.3f} | Northumbria: {f1_nor:.3f}")
-
-torch.save(best_state, '/workspace/Flood-Risk/flood_physics_cnn.pt')
-print("\nSaved to /workspace/Flood-Risk/flood_physics_cnn.pt")
-# ── 12. Visual comparison maps ────────────────────────────────────────
+# ── 13. Visual maps ───────────────────────────────────────────────────
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Patch
 
-# Risk colormap: Very Low=green, Low=yellow, Medium=orange, High=red
 RISK_CMAP   = mcolors.ListedColormap(['#2ecc71','#f1c40f','#e67e22','#e74c3c'])
 RISK_BOUNDS = [-0.5, 0.5, 1.5, 2.5, 3.5]
 RISK_NORM   = mcolors.BoundaryNorm(RISK_BOUNDS, RISK_CMAP.N)
 RISK_LABELS = ['Very Low','Low','Medium','High']
+OUT_DIR     = '/workspace/Flood-Risk/'
 
 def get_pred_map(model, feat_grid, label_grid, device,
                  patch_size=11, batch_size=8192):
-    """
-    Run inference on every valid pixel in the grid.
-    Returns pred_map (H, W) with predicted class 0-3, -1 where invalid.
-    """
-    half    = patch_size // 2
-    H, W, C = feat_grid.shape
+    half     = patch_size // 2
+    H, W, C  = feat_grid.shape
     pred_map = np.full((H, W), -1, dtype=np.int8)
 
-    # Collect all valid positions
     ys, xs = np.where(
         (label_grid >= 0) &
         (np.arange(H)[:, None] >= half) &
@@ -550,121 +567,158 @@ def get_pred_map(model, feat_grid, label_grid, device,
         (np.arange(W)[None, :] <  W - half)
     )
     positions = list(zip(ys.tolist(), xs.tolist()))
-    print(f"  Running inference on {len(positions):,} pixels...")
+    print(f"  Inference on {len(positions):,} pixels...")
 
     model.eval()
     all_preds = []
-
     with torch.no_grad():
         for start in range(0, len(positions), batch_size):
             batch_pos = positions[start:start+batch_size]
             patches   = np.stack([
                 feat_grid[i-half:i+half+1, j-half:j+half+1, :]
-                .transpose(2, 0, 1)
-                for i, j in batch_pos
+                .transpose(2,0,1)
+                for i,j in batch_pos
             ])
-            patches_t = torch.from_numpy(patches).to(device)
             with torch.amp.autocast('cuda'):
-                logits = model(patches_t)
-            preds = logits.argmax(1).cpu().numpy()
-            all_preds.extend(preds)
+                logits = model(torch.from_numpy(patches).to(device))
+            all_preds.extend(logits.argmax(1).cpu().numpy())
 
-    for (i, j), p in zip(positions, all_preds):
-        pred_map[i, j] = p
-
+    for (i,j), p in zip(positions, all_preds):
+        pred_map[i,j] = p
     return pred_map
 
-def plot_comparison(true_grid, pred_grid, title, save_path):
-    """
-    Side-by-side: ground truth vs predicted risk map.
-    Only shows valid pixels.
-    """
-    # Mask invalid pixels
+def plot_comparison(true_grid, pred_grid, region_name,
+                    y_true_flat, y_pred_flat, save_path):
     true_show = np.where(true_grid >= 0, true_grid, np.nan).astype(float)
     pred_show = np.where(pred_grid >= 0, pred_grid, np.nan).astype(float)
+    valid     = (true_grid >= 0) & (pred_grid >= 0)
+    diff      = np.where(valid, (pred_grid == true_grid).astype(float), np.nan)
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 8))
-    fig.suptitle(title, fontsize=16, fontweight='bold')
+    # Metrics
+    qwk  = cohen_kappa_score(y_true_flat, y_pred_flat, weights='quadratic')
+    mf1  = f1_score(y_true_flat, y_pred_flat, average='macro',    zero_division=0)
+    wf1  = f1_score(y_true_flat, y_pred_flat, average='weighted', zero_division=0)
+    acc  = accuracy_score(y_true_flat, y_pred_flat)
+    pcls = f1_score(y_true_flat, y_pred_flat, average=None, zero_division=0, labels=[0,1,2,3])
 
-    # Ground truth
-    im0 = axes[0].imshow(true_show, cmap=RISK_CMAP, norm=RISK_NORM,
-                          interpolation='nearest', aspect='auto')
-    axes[0].set_title('Ground Truth', fontsize=13)
-    axes[0].axis('off')
+    fig  = plt.figure(figsize=(22, 10))
+    fig.suptitle(f'Physics CNN — {region_name}', fontsize=16, fontweight='bold')
 
-    # Prediction
-    im1 = axes[1].imshow(pred_show, cmap=RISK_CMAP, norm=RISK_NORM,
-                          interpolation='nearest', aspect='auto')
-    axes[1].set_title('Physics CNN Prediction', fontsize=13)
-    axes[1].axis('off')
+    # Layout: 3 maps on top, metrics table on bottom
+    gs   = fig.add_gridspec(2, 3, height_ratios=[3, 1], hspace=0.35, wspace=0.1)
 
-    # Difference map
-    diff = np.full_like(true_show, np.nan)
-    valid = (true_grid >= 0) & (pred_grid >= 0)
-    diff[valid] = (pred_grid[valid] == true_grid[valid]).astype(float)
+    ax0  = fig.add_subplot(gs[0, 0])
+    ax1  = fig.add_subplot(gs[0, 1])
+    ax2  = fig.add_subplot(gs[0, 2])
+    ax_t = fig.add_subplot(gs[1, :])
 
+    # Ground truth map
+    ax0.imshow(true_show, cmap=RISK_CMAP, norm=RISK_NORM,
+               interpolation='nearest', aspect='auto')
+    ax0.set_title('Ground Truth', fontsize=13, fontweight='bold')
+    ax0.axis('off')
+
+    # Prediction map
+    ax1.imshow(pred_show, cmap=RISK_CMAP, norm=RISK_NORM,
+               interpolation='nearest', aspect='auto')
+    ax1.set_title('Physics CNN Prediction', fontsize=13, fontweight='bold')
+    ax1.axis('off')
+
+    # Correct/wrong map
     diff_cmap = mcolors.ListedColormap(['#e74c3c','#2ecc71'])
-    im2 = axes[2].imshow(diff, cmap=diff_cmap, vmin=0, vmax=1,
-                          interpolation='nearest', aspect='auto')
-    axes[2].set_title('Correct (green) / Wrong (red)', fontsize=13)
-    axes[2].axis('off')
+    ax2.imshow(diff, cmap=diff_cmap, vmin=0, vmax=1,
+               interpolation='nearest', aspect='auto')
+    ax2.set_title('Correct (green) / Wrong (red)', fontsize=13, fontweight='bold')
+    ax2.axis('off')
 
-    # Accuracy annotation on diff map
-    acc  = accuracy_score(true_grid[valid], pred_grid[valid])
-    f1   = f1_score(true_grid[valid], pred_grid[valid],
-                    average='weighted', zero_division=0)
-    axes[2].set_xlabel(f'Accuracy: {acc:.3f} | Weighted F1: {f1:.3f}',
-                       fontsize=11)
-
-    # Shared legend
+    # Legend for risk maps
     legend_patches = [
-        Patch(color=RISK_CMAP(i/(len(RISK_LABELS)-1)), label=RISK_LABELS[i])
-        for i in range(len(RISK_LABELS))
+        Patch(color=RISK_CMAP(i/3), label=RISK_LABELS[i])
+        for i in range(4)
     ]
-    fig.legend(handles=legend_patches, loc='lower center',
-               ncol=4, fontsize=11, frameon=True,
-               bbox_to_anchor=(0.5, 0.01))
+    ax0.legend(handles=legend_patches, loc='lower left',
+               fontsize=8, framealpha=0.8)
 
-    plt.tight_layout(rect=[0, 0.06, 1, 0.96])
+    # Metrics table
+    ax_t.axis('off')
+    col_labels = ['Region','Accuracy','QWK','Macro F1','Weighted F1',
+                  'F1 Very Low','F1 Low','F1 Medium','F1 High']
+    row_data   = [[
+        region_name,
+        f'{acc:.4f}',
+        f'{qwk:.4f}',
+        f'{mf1:.4f}',
+        f'{wf1:.4f}',
+        f'{pcls[0]:.4f}',
+        f'{pcls[1]:.4f}',
+        f'{pcls[2]:.4f}',
+        f'{pcls[3]:.4f}',
+    ]]
+    tbl = ax_t.table(
+        cellText=row_data,
+        colLabels=col_labels,
+        loc='center',
+        cellLoc='center'
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 2.2)
+
+    # Color header
+    for j in range(len(col_labels)):
+        tbl[0, j].set_facecolor('#2c3e50')
+        tbl[0, j].set_text_props(color='white', fontweight='bold')
+
+    # Color metric cells by performance
+    colors_qwk = ['#e74c3c','#e67e22','#f1c40f','#2ecc71']
+    thresholds  = [0.3, 0.5, 0.65]
+    def perf_color(val):
+        if val < thresholds[0]: return '#e74c3c'
+        if val < thresholds[1]: return '#e67e22'
+        if val < thresholds[2]: return '#f1c40f'
+        return '#2ecc71'
+
+    metric_cols = [1,2,3,4,5,6,7,8]
+    metric_vals = [acc, qwk, mf1, wf1, pcls[0], pcls[1], pcls[2], pcls[3]]
+    for j, v in zip(metric_cols, metric_vals):
+        tbl[1, j].set_facecolor(perf_color(float(v)))
+
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path}")
 
-def plot_class_distribution(true_grid, pred_grid, title, save_path):
-    """Bar chart comparing true vs predicted class distribution."""
-    valid  = (true_grid >= 0) & (pred_grid >= 0)
-    true_v = true_grid[valid]
-    pred_v = pred_grid[valid]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(title, fontsize=14, fontweight='bold')
-
+def plot_class_distribution(true_grid, pred_grid, region_name,
+                             y_true_flat, y_pred_flat, save_path):
     colors = ['#2ecc71','#f1c40f','#e67e22','#e74c3c']
     x      = np.arange(4)
-    width  = 0.35
 
-    for ax, data, label in zip(axes, [true_v, pred_v], ['Ground Truth','Prediction']):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f'Class Distribution — {region_name}', fontsize=14, fontweight='bold')
+
+    for ax, data, lbl in zip(axes,
+                              [y_true_flat, y_pred_flat],
+                              ['Ground Truth','Physics CNN Prediction']):
         counts = [(data == c).sum() for c in range(4)]
         total  = sum(counts)
         pcts   = [c/total*100 for c in counts]
-        bars   = ax.bar(x, pcts, color=colors, edgecolor='white', linewidth=0.5)
+        bars   = ax.bar(x, pcts, color=colors, edgecolor='white', linewidth=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels(RISK_LABELS, fontsize=11)
         ax.set_ylabel('% of pixels', fontsize=11)
-        ax.set_title(label, fontsize=12)
-        ax.set_ylim(0, max(pcts) * 1.2)
+        ax.set_title(lbl, fontsize=12, fontweight='bold')
+        ax.set_ylim(0, max(pcts) * 1.25)
         for bar, pct in zip(bars, pcts):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                    f'{pct:.1f}%', ha='center', va='bottom', fontsize=9)
+            ax.text(bar.get_x() + bar.get_width()/2,
+                    bar.get_height() + 0.5,
+                    f'{pct:.1f}%', ha='center', va='bottom', fontsize=10)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path}")
 
-# ── Generate maps ─────────────────────────────────────────────────────
+# Generate maps
 print("\nGenerating prediction maps...")
-OUT_DIR = '/workspace/Flood-Risk/'
 
 print("Severn inference...")
 pred_map_s = get_pred_map(model, grid_s, labels_s, device)
@@ -672,33 +726,42 @@ pred_map_s = get_pred_map(model, grid_s, labels_s, device)
 print("Northumbria inference...")
 pred_map_n = get_pred_map(model, grid_n, labels_n, device)
 
+valid_s = (labels_s >= 0) & (pred_map_s >= 0)
+valid_n = (labels_n >= 0) & (pred_map_n >= 0)
+
 print("Plotting Severn...")
 plot_comparison(
     labels_s, pred_map_s,
-    'Severn — Physics CNN (Seen Region)',
+    'Severn (Seen Region)',
+    labels_s[valid_s], pred_map_s[valid_s],
     OUT_DIR + 'map_severn_physics_cnn.png'
 )
 plot_class_distribution(
     labels_s, pred_map_s,
-    'Severn Class Distribution — Physics CNN',
+    'Severn (Seen Region)',
+    labels_s[valid_s], pred_map_s[valid_s],
     OUT_DIR + 'dist_severn_physics_cnn.png'
 )
 
 print("Plotting Northumbria...")
 plot_comparison(
     labels_n, pred_map_n,
-    'Northumbria — Physics CNN (Unseen Region)',
+    'Northumbria (Unseen Region)',
+    labels_n[valid_n], pred_map_n[valid_n],
     OUT_DIR + 'map_northumbria_physics_cnn.png'
 )
 plot_class_distribution(
     labels_n, pred_map_n,
-    'Northumbria Class Distribution — Physics CNN',
+    'Northumbria (Unseen Region)',
+    labels_n[valid_n], pred_map_n[valid_n],
     OUT_DIR + 'dist_northumbria_physics_cnn.png'
 )
 
-print("\nAll maps saved to /workspace/Flood-Risk/")
-print("Files:")
-print("  map_severn_physics_cnn.png       — spatial prediction vs truth")
-print("  map_northumbria_physics_cnn.png  — spatial prediction vs truth")
-print("  dist_severn_physics_cnn.png      — class distribution comparison")
-print("  dist_northumbria_physics_cnn.png — class distribution comparison")
+torch.save(best_state, OUT_DIR + 'flood_physics_cnn.pt')
+
+print("\n── Output files ──")
+print(f"  map_severn_physics_cnn.png")
+print(f"  map_northumbria_physics_cnn.png")
+print(f"  dist_severn_physics_cnn.png")
+print(f"  dist_northumbria_physics_cnn.png")
+print(f"  flood_physics_cnn.pt")
